@@ -5,10 +5,13 @@
 """
 
 import json
+import random
 from functools import cache
 from pathlib import Path
+from datetime import datetime, timezone
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+LOG_DIR = Path(__file__).resolve().parent.parent / "learning_log"
 MAX_RESULTS = 3
 
 
@@ -77,3 +80,67 @@ def get_lecture_summary(lecture: int) -> str:
         available = sorted(p.stem for p in (DATA_DIR / "lectures").glob("*.md"))
         return f"第{lecture}回の要点はまだありません。用意されている回: {', '.join(available)}"
     return path.read_text(encoding="utf-8")
+
+
+def make_quiz(lecture: int) -> str:
+    """指定した回の用語集から確認問題を1問作成し、問題と答えを返す。
+
+    「第2回の内容から確認問題を1問出して」のように、
+    指定した回の復習問題を求められたときに使う。
+    lecture には講義回の番号を整数で指定する。
+    """
+    # 指定した回の用語を集める
+    terms = [
+        entry
+        for entry in load_glossary()
+        if entry["lecture"] == lecture
+    ]
+
+    # 該当する用語が存在しない場合
+    if not terms:
+        return json.dumps(
+            {
+                "error": (
+                    f"第{lecture}回の用語は"
+                    "見つかりませんでした。"
+                )
+            },
+            ensure_ascii=False,
+        )
+
+    # 用語を1つ選ぶ
+    selected = random.choice(terms)
+
+    # 確認問題と正解を生成する
+    result = {
+        "question": f"「{selected['term']}」の意味は？",
+        "answer": selected["definition"],
+    }
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+def save_learning_log(content: str) -> str:
+    """利用者の学習記録をローカルファイルに保存する。
+
+    「今日学んだことを記録して」「この内容を学習ログに保存して」
+    など、明示的に保存を求められた場合に使う。
+    content には保存する学習内容を指定する。
+    実行前に必ず利用者の承認を得る必要がある。
+    """
+    content = content.strip()
+    if not content:
+        return "学習記録が空のため、保存しませんでした。"
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = LOG_DIR / "learning_log.jsonl"
+
+    record = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "content": content,
+    }
+
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return f"学習記録を保存しました: {path.name}"

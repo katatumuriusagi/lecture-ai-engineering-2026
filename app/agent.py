@@ -16,7 +16,11 @@ import inspect
 import json
 from pathlib import Path
 
-from pydantic_ai import Agent
+from pydantic_ai import (
+    Agent,
+    DeferredToolRequests,
+    DeferredToolResults,
+)
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
@@ -35,14 +39,28 @@ INSTRUCTIONS = """\
 - 用語集に見つからないことは、推測で断定せず「用語集にはない」と伝える。
 - 回答の最後に、関係する回（第N回）を示す。
 - 宿題の答えそのものは書かず、考え方のヒントで導く。
+- 学習内容の保存を明示的に依頼された場合は、save_learning_log を呼び出す。
+- 保存前の承認は CLI 側で行うため、ツールを呼ばずに自然言語だけで承認を求めて終了しない。
+- 保存ツールの成功結果が返るまで、保存完了を報告しない。
+- 承認を拒否された場合は、保存していないことを正しく伝える。
 """
 
 # モデルは実行時に渡す（テストではAPIを呼ばない TestModel に差し替えるため）
-agent = Agent(instructions=INSTRUCTIONS)
+# モデルは実行時に渡す
+agent = Agent(
+    instructions=INSTRUCTIONS,
+    output_type=[str, DeferredToolRequests],
+)
+
 agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
+agent.tool_plain(tools.make_quiz)
 
-# TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
+# 保存操作は必ず承認を要求する
+agent.tool_plain(
+    tools.save_learning_log,
+    requires_approval=True,
+)
 
 # 第5回: 使う MCP サーバーの設定ファイル。Claude Desktop や Cursor と同じ "mcpServers" 形式
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
@@ -127,14 +145,76 @@ def main() -> None:
     print(f"[model] {MODEL}")
     if args.mcp:
         print("[tools] MCP サーバー（app/mcp_servers.json）")
+
     try:
-        result = target.run_sync(args.question, model=build_model())
+        result = target.run_sync(
+            args.question,
+            model=build_model(),
+        )
+
+        usage_history = [result.usage]
+
+        # 承認待ちのツール呼び出しを処理
+        for _ in range(3):
+            if not isinstance(result.output, DeferredToolRequests):
+                break
+
+            pending = result.output
+
+            if pending.calls:
+                raise SystemExit(
+                    "外部実行ツールには対応していません。"
+                )
+
+            decisions = DeferredToolResults()
+
+            for call in pending.approvals:
+                print(f"\n[approval] {call.tool_name}")
+                print(
+                    json.dumps(
+                        call.args_as_dict(),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+
+                answer = input(
+                    "この操作を承認しますか？ [y/N]: "
+                ).strip().lower()
+
+                approved = (
+                    call.tool_name == "save_learning_log"
+                    and answer in {"y", "yes"}
+                )
+
+                decisions.approvals[call.tool_call_id] = approved
+
+            # 同じ会話履歴を使い、承認結果を渡して再開
+            result = target.run_sync(
+                message_history=result.all_messages(),
+                deferred_tool_results=decisions,
+                model=build_model(),
+            )
+            usage_history.append(result.usage)
+
+        if isinstance(result.output, DeferredToolRequests):
+            raise SystemExit(
+                "承認確認の上限回数に達したため終了しました。"
+            )
+
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
+
     print(result.output)
+
     if args.trace:
         print_trace(result)
+        if len(usage_history) > 1:
+            print("[usage per run]")
+            for i, usage in enumerate(usage_history, 1):
+                print(f"  run {i}: {usage}")
+
 
 
 if __name__ == "__main__":
